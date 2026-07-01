@@ -1,0 +1,16 @@
+# gurkecode 服务商配置
+# 每个 provider 代表一个大模型接入点，可配置多个。
+# 启动时若仅一个 provider 则直接进入对话；多个则弹出选择界面。
+providers:
+  #- name: "Claude Sonnet (Anthropic)"
+    #protocol: anthropic
+    #api_key: "your-anthropic-api-key-here"
+    #model: claude-sonnet-4-6
+    # thinking: true     # 开启扩展思考（仅 Anthropic 协议支持）
+    # base_url: https://api.anthropic.com  # 可自定义端点
+
+  #- name: "GPT-4o (OpenAI)"
+    #protocol: openai
+    #api_key: "your-openai-api-key-here"
+    #model: gpt-4o
+    # base_url: https://api.openai.com      # 可自定义端点（兼容服务需填写对应地址）
