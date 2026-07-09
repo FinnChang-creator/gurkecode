@@ -46,8 +46,11 @@ class AnthropicProtocol(ChatProtocol):
             base_url: 自定义 API 端点地址，None 则使用默认 https://api.anthropic.com
         """
         self._api_key = api_key
-        #删除末尾斜杠防止双斜杠
+        # 删除末尾斜杠防止双斜杠
         self._base_url = (base_url or ANTHROPIC_DEFAULT_BASE_URL).rstrip("/")
+        # 跟踪正在构建的 tool_use 块（每次请求独立）
+        # 键为 content_block index → {id, name, args_str}
+        self._pending_tool_uses: dict[int, dict] = {}
 
     @property
     def protocol_name(self) -> str:
@@ -58,6 +61,7 @@ class AnthropicProtocol(ChatProtocol):
         messages: list[ChatMessage],
         model: str,
         thinking: bool,
+        tools: list[dict] | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """发起一次流式对话请求（Anthropic Messages API）。
 
@@ -69,8 +73,11 @@ class AnthropicProtocol(ChatProtocol):
         Yields:
             StreamEvent 序列
         """
+        # 清除上一次请求可能残留的工具状态
+        self._pending_tool_uses.clear()
+
         # 构建请求体：Anthropic 需要分离 system 和 messages
-        body = self._build_request_body(messages, model, thinking)
+        body = self._build_request_body(messages, model, thinking, tools)
         url = f"{self._base_url}/v1/messages"
 
         headers = {
@@ -131,14 +138,23 @@ class AnthropicProtocol(ChatProtocol):
             )
 
     def _build_request_body(
-        self, messages: list[ChatMessage], model: str, thinking: bool
+        self, messages: list[ChatMessage], model: str, thinking: bool,
+        tools: list[dict] | None = None,
     ) -> dict:
         """将内部消息列表转换为 Anthropic Messages API 请求体。
+
+        处理消息格式转换：
+        - system → 提取为顶层 "system" 参数
+        - user → role="user", content="..."
+        - assistant（纯文本）→ role="assistant", content=[{"type": "text", "text": "..."}]
+        - assistant（工具调用）→ role="assistant", content=[{"type": "tool_use", ...}]
+        - tool → role="user", content=[{"type": "tool_result", ...}]
 
         Args:
             messages: 完整对话上下文
             model: 模型标识
             thinking: 是否开启扩展思考
+            tools: 可选工具定义列表（需转换为 Anthropic 格式）
 
         Returns:
             Anthropic API 请求体字典
@@ -147,11 +163,62 @@ class AnthropicProtocol(ChatProtocol):
         system_content = ""
         chat_messages = []
 
-        for msg in messages:
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
             if msg.role == "system":
                 system_content = msg.content
-            elif msg.role in ("user", "assistant"):
-                chat_messages.append({"role": msg.role, "content": msg.content})
+                i += 1
+            elif msg.role == "user":
+                chat_messages.append({"role": "user", "content": msg.content})
+                i += 1
+            elif msg.role == "assistant":
+                # assistant 消息可能有工具调用
+                if msg.tool_calls:
+                    # Anthropic 格式：content 数组中混合 text 和 tool_use 块
+                    content_blocks = []
+                    if msg.content:
+                        content_blocks.append({
+                            "type": "text",
+                            "text": msg.content,
+                        })
+                    for tc in msg.tool_calls:
+                        content_blocks.append({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.name,
+                            "input": tc.arguments,
+                        })
+                    chat_messages.append({
+                        "role": "assistant",
+                        "content": content_blocks,
+                    })
+                else:
+                    chat_messages.append({
+                        "role": "assistant",
+                        "content": msg.content,
+                    })
+                i += 1
+            elif msg.role == "tool":
+                # 工具结果回灌：Anthropic 要求所有 tool_result 块
+                # 合并到一条 role="user" 消息中（而非每条工具结果各发一条）
+                # 因此需要收集连续的所有 tool 消息，聚合为一个 user 消息
+                tool_result_blocks: list[dict] = []
+                while i < len(messages) and messages[i].role == "tool":
+                    tmsg = messages[i]
+                    tool_result_blocks.append({
+                        "type": "tool_result",
+                        "tool_use_id": tmsg.tool_call_id or "",
+                        "content": tmsg.content,
+                    })
+                    i += 1
+                chat_messages.append({
+                    "role": "user",
+                    "content": tool_result_blocks,
+                })
+            else:
+                # 未知角色：跳过避免请求失败
+                i += 1
 
         body: dict = {
             "model": model,
@@ -172,13 +239,27 @@ class AnthropicProtocol(ChatProtocol):
             }
             # 注意：开启 thinking 后，响应中会有 thinking_delta 事件
 
+        # 注入工具定义（转换为 Anthropic 格式）
+        if tools:
+            anthropic_tools = []
+            for t in tools:
+                func = t.get("function", t)
+                anthropic_tools.append({
+                    "name": func["name"],
+                    "description": func["description"],
+                    "input_schema": func["parameters"],
+                })
+            body["tools"] = anthropic_tools
+
         return body
 
     def _parse_sse_event(self, event: dict) -> StreamEvent | None:
         """解析单个 SSE 事件，转换为 StreamEvent。
 
-        只处理我们关心的事件类型：
-        - content_block_delta: 正文增量或思考增量
+        处理的事件类型：
+        - content_block_start: 检测 tool_use 块的开始
+        - content_block_delta: 正文增量 / 思考增量 / tool_use 参数增量
+        - content_block_stop: tool_use 块结束（产出 tool_call_end）
         - message_stop: 正常结束
         - error: 服务端错误
 
@@ -196,8 +277,26 @@ class AnthropicProtocol(ChatProtocol):
         except json.JSONDecodeError:
             return None
 
-        # ---- content_block_delta：正文或思考的内容增量 ----
-        if event_type == "content_block_delta":
+        # ---- content_block_start：检测 tool_use 块的开始 ----
+        if event_type == "content_block_start":
+            content_block = data.get("content_block", {})
+            if content_block.get("type") == "tool_use":
+                index = data.get("index", 0)
+                tool_id = content_block.get("id", "")
+                tool_name = content_block.get("name", "")
+                self._pending_tool_uses[index] = {
+                    "id": tool_id,
+                    "name": tool_name,
+                    "args_str": "",
+                }
+                return StreamEvent(
+                    kind=StreamEvent.KIND_TOOL_CALL_START,
+                    tool_call_id=tool_id,
+                    tool_call_name=tool_name,
+                )
+
+        # ---- content_block_delta：正文 / 思考 / tool_use 参数增量 ----
+        elif event_type == "content_block_delta":
             delta = data.get("delta", {})
             delta_type = delta.get("type", "")
 
@@ -210,6 +309,35 @@ class AnthropicProtocol(ChatProtocol):
             elif delta_type == "thinking_delta":
                 # 思考增量：标记为 thinking_delta（引擎层应丢弃）
                 return StreamEvent(kind=StreamEvent.KIND_THINKING_DELTA)
+            elif delta_type == "input_json_delta":
+                # tool_use 的 JSON 参数片段
+                index = data.get("index", 0)
+                partial_json = delta.get("partial_json", "")
+                if index in self._pending_tool_uses:
+                    self._pending_tool_uses[index]["args_str"] += partial_json
+                    return StreamEvent(
+                        kind=StreamEvent.KIND_TOOL_CALL_DELTA,
+                        text=partial_json,
+                        tool_call_id=self._pending_tool_uses[index]["id"],
+                        tool_call_name=self._pending_tool_uses[index]["name"],
+                    )
+
+        # ---- content_block_stop：工具调用参数接收完毕 ----
+        elif event_type == "content_block_stop":
+            index = data.get("index", 0)
+            if index in self._pending_tool_uses:
+                state = self._pending_tool_uses.pop(index)
+                # 解析累积的 JSON 参数
+                try:
+                    args = json.loads(state["args_str"])
+                except json.JSONDecodeError:
+                    args = {}
+                return StreamEvent(
+                    kind=StreamEvent.KIND_TOOL_CALL_END,
+                    tool_call_id=state["id"],
+                    tool_call_name=state["name"],
+                    tool_arguments=args,
+                )
 
         # ---- message_stop：正常结束 ----
         elif event_type == "message_stop":
@@ -223,7 +351,7 @@ class AnthropicProtocol(ChatProtocol):
                 kind=StreamEvent.KIND_ERROR, error=error_msg
             )
 
-        # 其他事件（message_start, content_block_start, ping 等）忽略
+        # 其他事件（message_start, ping 等）忽略
         return None
 
     def _parse_error(self, status_code: int, body_bytes: bytes) -> str:
@@ -238,12 +366,15 @@ class AnthropicProtocol(ChatProtocol):
         """
         try:
             body = json.loads(body_bytes)
-            error_data = body.get("error", {})
-            api_message = error_data.get("message", "")
-            error_type = error_data.get("type", "")
-            if api_message:
-                return f"Anthropic API 错误 ({status_code} {error_type})：{api_message}"
-        except (json.JSONDecodeError, AttributeError):
+            # 确保响应体是 JSON 对象（dict），不是数组等其他类型
+            if isinstance(body, dict):
+                error_data = body.get("error", {})
+                api_message = error_data.get("message", "")
+                error_type = error_data.get("type", "")
+                if api_message:
+                    return f"Anthropic API 错误 ({status_code} {error_type})：{api_message}"
+        except json.JSONDecodeError:
+            # 响应体不是合法的 JSON，降级到 HTTP 状态码消息
             pass
 
         # 降级：使用 HTTP 状态码和原始响应

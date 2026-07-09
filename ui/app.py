@@ -2,7 +2,7 @@
 
 基于 textual.App 的全功能终端对话界面。
 组合 Banner、ChatView、InputBox、StatusBar 四个 widget，
-协调消息发送、流式响应更新和计时器。
+协调消息发送、流式响应更新、工具调用展示和计时器。
 
 多 provider 时，启动后先展示 ProviderSelect 选择界面；
 选定后再进入对话界面。
@@ -17,6 +17,7 @@ from config.models import ProviderConfig
 from engine import ChatEngine
 from protocol.adapter import create_protocol
 from protocol.models import ChatProtocol, StreamEvent
+from tools import registry as tool_registry
 from ui.banner import Banner
 from ui.chat_view import ChatView
 from ui.input_box import InputBox
@@ -183,10 +184,47 @@ class GurkeApp(App):
         try:
             # ---- 3. 流式事件处理 ----
             async for event in self._engine.stream_response(
-                self._protocol, self._config
+                self._protocol, self._config, tool_registry
             ):
                 if event.kind == StreamEvent.KIND_TEXT_DELTA:
                     chat_view.append_streaming(event.text)
+
+                elif event.kind == StreamEvent.KIND_TOOL_CALL_START:
+                    # 工具调用开始：在对话区显示工具行
+                    chat_view.append_tool_call(
+                        event.tool_call_id, event.tool_call_name
+                    )
+
+                elif event.kind == StreamEvent.KIND_TOOL_CALL_END:
+                    # 工具调用参数完整：更新工具行显示关键参数
+                    if event.tool_arguments:
+                        # 提取关键参数作为摘要
+                        args_keys = list(event.tool_arguments.keys())
+                        if args_keys:
+                            # 取第一个参数值作为摘要（如 read_file 的 path）
+                            first_val = str(event.tool_arguments.get(args_keys[0], ""))
+                            if len(first_val) > 40:
+                                first_val = first_val[:40] + "..."
+                            chat_view.append_tool_call(
+                                event.tool_call_id,
+                                event.tool_call_name,
+                                first_val,
+                            )
+
+                elif event.kind == StreamEvent.KIND_TOOL_EXECUTED:
+                    # 工具执行完毕：显示结果摘要
+                    success = (
+                        event.tool_arguments.get("success", False)
+                        if event.tool_arguments
+                        else False
+                    )
+                    # 生成简洁的结果摘要
+                    result_text = event.text
+                    if len(result_text) > 80:
+                        result_text = result_text[:80] + "..."
+                    chat_view.update_tool_result(
+                        event.tool_call_id, result_text, success
+                    )
 
                 elif event.kind == StreamEvent.KIND_DONE:
                     self._cancel_timer()
