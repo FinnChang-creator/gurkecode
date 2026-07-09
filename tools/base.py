@@ -47,6 +47,11 @@ class BaseTool(ABC):
     - parameters: JSON Schema 格式的参数定义，告诉模型如何传参
     - execute(): 执行入口，接收已解析的参数字典，返回 ToolResult
 
+    此外，还可以覆盖以下方法以优化 TUI 显示：
+    - display_name: 给用户看的工具名称（中文，如 "读取文件"）
+    - format_params(): 将参数格式化为简短摘要
+    - format_result(): 将执行结果格式化为简短摘要
+
     子类只需要实现 execute() 中的具体逻辑，
     错误处理在方法内部完成——execute() 不应该抛出异常。
     """
@@ -103,3 +108,59 @@ class BaseTool(ABC):
             ToolResult: 执行结果（成功或失败）
         """
         ...
+
+    # ---- 面向 TUI 的显示方法（子类可选覆盖） ----
+
+    @property
+    def display_name(self) -> str:
+        """返回工具的人类可读名称，用于 TUI 工具行显示。
+
+        子类应覆盖此属性返回中文名称（如 "读取文件" "执行命令"）。
+        默认降级为返回内部 name（snake_case 英文名）。
+
+        Returns:
+            给用户看的工具名称
+        """
+        return self.name
+
+    def format_params(self, arguments: dict) -> str:
+        """将工具参数格式化为人类可读的简短摘要，显示在工具行上。
+
+        默认返回第一个参数的值（截断至 50 字符）。
+        子类可以覆盖此方法来定制显示（例如只显示 path、截断 command 等）。
+
+        Args:
+            arguments: 工具的调用参数字典
+
+        Returns:
+            简短参数摘要（如文件名、命令等），供 TUI 在 ● 工具名(摘要) 中显示
+        """
+        if not arguments:
+            return ""
+        # 跳过内部字段（call_id 是引擎注入的，不应显示）
+        display_args = {k: v for k, v in arguments.items() if k != "call_id"}
+        if not display_args:
+            return ""
+        # 取第一个参数值作为摘要
+        first_val = str(next(iter(display_args.values()), ""))
+        if len(first_val) > 50:
+            first_val = first_val[:50] + "..."
+        return first_val
+
+    def format_result(self, result: ToolResult) -> str:
+        """将工具执行结果格式化为人类可读的简短摘要，显示在结果行上。
+
+        默认截取 content 前 80 字符。子类应覆盖此方法，
+        从 ToolResult.content 中提取关键信息（行数、匹配数、退出码等）
+        生成简洁的摘要。
+
+        Args:
+            result: 工具执行结果
+
+        Returns:
+            简短结果摘要（供 TUI 在 ✓/✗ 后显示）
+        """
+        text = result.content
+        if len(text) > 80:
+            text = text[:80] + "..."
+        return text

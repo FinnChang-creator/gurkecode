@@ -34,6 +34,11 @@ class Bash(BaseTool):
         return "bash"
 
     @property
+    def display_name(self) -> str:
+        """用户可读的工具名称。"""
+        return "执行命令"
+
+    @property
     def description(self) -> str:
         return (
             "Execute a shell command in the current working directory. "
@@ -57,6 +62,23 @@ class Bash(BaseTool):
             },
             "required": ["command"],
         }
+
+    def format_params(self, arguments: dict) -> str:
+        """截断显示命令字符串作为参数摘要。"""
+        cmd = arguments.get("command", "")
+        if len(cmd) > 60:
+            cmd = cmd[:60] + "..."
+        return cmd
+
+    def format_result(self, result: ToolResult) -> str:
+        """提取退出码和输出长度信息生成摘要。"""
+        if not result.success:
+            return result.content[:80]
+        # 从 content 中提取退出码（格式："[退出码: N]"）
+        for line in result.content.split("\n"):
+            if line.startswith("[退出码:"):
+                return line
+        return "已完成"
 
     async def execute(self, arguments: dict) -> ToolResult:
         """执行 shell 命令。
