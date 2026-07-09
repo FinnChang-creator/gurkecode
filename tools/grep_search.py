@@ -32,6 +32,11 @@ class GrepSearch(BaseTool):
         return "grep_search"
 
     @property
+    def display_name(self) -> str:
+        """用户可读的工具名称。"""
+        return "搜索内容"
+
+    @property
     def description(self) -> str:
         return (
             "Search for a pattern in file contents. "
@@ -66,6 +71,18 @@ class GrepSearch(BaseTool):
             },
             "required": ["pattern"],
         }
+
+    def format_params(self, arguments: dict) -> str:
+        """显示搜索模式作为参数摘要。"""
+        return arguments.get("pattern", "")
+
+    def format_result(self, result: ToolResult) -> str:
+        """提取匹配数量生成摘要。"""
+        if not result.success:
+            return result.content[:80]
+        # content 第一行就是 "找到 N 条匹配..." 的摘要
+        first_line = result.content.split("\n")[0]
+        return first_line
 
     async def execute(self, arguments: dict) -> ToolResult:
         """搜索文件内容。

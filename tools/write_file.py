@@ -25,6 +25,11 @@ class WriteFile(BaseTool):
         return "write_file"
 
     @property
+    def display_name(self) -> str:
+        """用户可读的工具名称。"""
+        return "写入文件"
+
+    @property
     def description(self) -> str:
         return (
             "Write content to a file at the given path. "
@@ -51,6 +56,16 @@ class WriteFile(BaseTool):
             },
             "required": ["path", "content"],
         }
+
+    def format_params(self, arguments: dict) -> str:
+        """只显示文件路径作为参数摘要。"""
+        return arguments.get("path", "")
+
+    def format_result(self, result: ToolResult) -> str:
+        """简洁显示写入结果。"""
+        if not result.success:
+            return result.content[:80]
+        return result.content  # 写入工具的成功消息已经很简洁了
 
     async def execute(self, arguments: dict) -> ToolResult:
         """写入文件内容。

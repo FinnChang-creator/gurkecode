@@ -25,6 +25,11 @@ class EditFile(BaseTool):
         return "edit_file"
 
     @property
+    def display_name(self) -> str:
+        """用户可读的工具名称。"""
+        return "编辑文件"
+
+    @property
     def description(self) -> str:
         return (
             "Replace a specific string in a file with a new string. "
@@ -64,6 +69,16 @@ class EditFile(BaseTool):
             },
             "required": ["path", "old_string", "new_string"],
         }
+
+    def format_params(self, arguments: dict) -> str:
+        """只显示文件路径作为参数摘要。"""
+        return arguments.get("path", "")
+
+    def format_result(self, result: ToolResult) -> str:
+        """简洁显示编辑结果。"""
+        if not result.success:
+            return result.content[:80]
+        return result.content  # 编辑工具的成功消息已经很简洁了
 
     async def execute(self, arguments: dict) -> ToolResult:
         """执行精确匹配替换。

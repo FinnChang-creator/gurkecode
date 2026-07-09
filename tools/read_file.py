@@ -33,6 +33,11 @@ class ReadFile(BaseTool):
         return "read_file"
 
     @property
+    def display_name(self) -> str:
+        """用户可读的工具名称。"""
+        return "读取文件"
+
+    @property
     def description(self) -> str:
         return (
             "Read the contents of a file at the given path. "
@@ -58,6 +63,23 @@ class ReadFile(BaseTool):
             },
             "required": ["path"],
         }
+
+    def format_params(self, arguments: dict) -> str:
+        """只显示文件路径作为参数摘要。"""
+        return arguments.get("path", "")
+
+    def format_result(self, result: ToolResult) -> str:
+        """提取行数、大小信息生成摘要。"""
+        if not result.success:
+            return result.content[:80]
+        # 从 content 中统计行数（带行号格式："1234\t...")
+        lines = result.content.split("\n")
+        filtered = [l for l in lines if l and not l.startswith("[结果已截断")]
+        line_count = len(filtered)
+        char_count = len(result.content)
+        if "[结果已截断" in result.content:
+            return f"已截断显示 {line_count} 行，共 {char_count} 字符"
+        return f"{line_count} 行，{char_count} 字符"
 
     async def execute(self, arguments: dict) -> ToolResult:
         """读取文件内容。

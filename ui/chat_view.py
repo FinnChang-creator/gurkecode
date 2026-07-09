@@ -169,20 +169,32 @@ class ChatView(VerticalScroll):
         self.mount(error_widget)
         self._scroll_to_bottom()
 
-    def append_tool_call(self, call_id: str, name: str, args_summary: str = "") -> None:
+    def append_tool_call(
+        self,
+        call_id: str,
+        name: str,
+        args_summary: str = "",
+        display_name: str = "",
+    ) -> None:
         """追加一条工具调用行到对话区（Claude Code 风格）。
 
-        格式：● 工具名(参数摘要)
+        格式：● 显示名(参数摘要)
         首次调用时创建 widget，后续同名调用更新参数。
+        call_id 只用于内部追踪，不显示给用户。
 
         Args:
-            call_id: 工具调用的唯一 ID（模型生成）
-            name: 工具名称，如 "read_file"、"bash"
+            call_id: 工具调用的唯一 ID（模型生成，仅内部使用）
+            name: 工具内部名（如 "read_file"，降级显示用）
             args_summary: 关键参数的简短摘要
+            display_name: 给用户看的工具名称（如 "读取文件"），
+                          为空时降级使用 name
         """
+        # 优先用 display_name，为空时降级到 name
+        visible_name = display_name or name
+
         if call_id not in self._tool_widgets:
-            # 新建工具行 widget
-            display = f"● {name}"
+            # 新建工具行 widget：● 工具名
+            display = f"● {visible_name}"
             if args_summary:
                 display += f"({args_summary})"
             widget = Static(display, classes="tool-call")
@@ -190,7 +202,7 @@ class ChatView(VerticalScroll):
             self._tool_widgets[call_id] = widget
         else:
             # 更新参数摘要（流式参数逐渐到达时）
-            display = f"● {name}({args_summary})"
+            display = f"● {visible_name}({args_summary})"
             self._tool_widgets[call_id].update(display)
 
         self._scroll_to_bottom()
@@ -200,13 +212,14 @@ class ChatView(VerticalScroll):
     ) -> None:
         """更新工具调用的结果摘要。
 
-        在工具行下方追加结果行：
-        - 成功：✓ 结果摘要（绿色）
-        - 失败：✗ 错误描述（红色）
+        在工具行下方追加结果行，用户只需看 ✓/✗ 即可判断成败。
+        - 成功：✓ 结果摘要（绿色，如 "42 行，1366 字符"）
+        - 失败：✗ 错误描述（红色，如 "文件不存在：foo.txt"）
+        call_id 只用于内部关联，不显示给用户。
 
         Args:
             call_id: 工具调用 ID（必须与 append_tool_call 的 call_id 对应）
-            result_summary: 结果摘要文本
+            result_summary: 给用户看的结果摘要文本（由工具的 format_result 生成）
             success: 是否执行成功
         """
         prefix = "✓" if success else "✗"
