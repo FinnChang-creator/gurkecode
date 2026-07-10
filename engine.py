@@ -45,20 +45,28 @@ When the user asks you to perform an action (read a file, run a command, etc.), 
 use the appropriate tool immediately.
 
 After receiving tool results, use them to give a complete, accurate answer. \
-Only request tools in the first response; after receiving tool results, \
-provide your final text answer without requesting additional tools.\
+You may call tools across multiple rounds until the task is complete — \
+each round you can request new tools based on previous results. \
+When you have enough information, provide your final text answer \
+without requesting additional tools.\
 """
+
+# Agent Loop 最大循环轮次上限
+# 防止模型陷入无限工具调用循环，达到上限后强制终止并以不带工具的请求收尾
+MAX_AGENT_ITERATIONS = 50
 
 
 class ChatEngine:
     """对话引擎。
 
     维护单次会话内的完整对话历史，编排每次 LLM 请求的上下文组装、
-    流式事件分发和工具循环（如果有工具可用）。
+    流式事件分发和 Agent Loop 循环。
 
-    工具循环流程：
-    第一轮（带工具）→ 检测工具调用 → 执行工具 → 回灌历史
-    → 第二轮（不带工具）→ 纯文本答复 → 结束
+    Agent Loop 流程：
+    while 轮次 < 上限：
+      发起请求（带工具）→ 检测工具调用 → 执行 → 回灌历史 → 继续下一轮
+      模型返回纯文本（无工具调用）时自然终止
+    达到上限时强制终止并以不带工具的请求收尾
     """
 
     def __init__(self):
@@ -96,12 +104,13 @@ class ChatEngine:
         """发起一次流式对话请求并逐项产出事件。
 
         在有工具注册中心时：
-        1. 第一轮请求：携带工具定义
+        1. 进入 Agent Loop，每轮请求都携带工具定义
         2. 收集工具调用、产出工具事件
-        3. 如有工具调用：执行、回灌、第二轮请求（不带工具）
-        4. 第二轮请求产出最终文本答复
+        3. 如有工具调用：执行、回灌，进入下一轮循环
+        4. 模型返回纯文本答复时自然终止
+        5. 达到 MAX_AGENT_ITERATIONS 上限时强制终止并收尾
 
-        无工具注册中心时：行为与 ch02 完全一致。
+        无工具注册中心时：单轮请求，行为与 ch02 完全一致。
 
         Args:
             protocol: 协议适配器实例
@@ -126,13 +135,13 @@ class ChatEngine:
             tool_defs = tool_registry.export_definitions()
 
         # ---- 2. 发起流式请求 ----
-        async for event in self._do_stream_and_handle_tools(
+        async for event in self._do_agent_loop(
             protocol, config, tool_registry, full_messages,
             tool_defs, system_content,
         ):
             yield event
 
-    async def _do_stream_and_handle_tools(
+    async def _do_agent_loop(
         self,
         protocol: ChatProtocol,
         config: ProviderConfig,
@@ -141,183 +150,213 @@ class ChatEngine:
         tool_defs: list[dict] | None,
         system_content: str,
     ) -> AsyncIterator[StreamEvent]:
-        """发起一次流式请求，检测工具调用，必要时递归进入第二轮。
+        """Agent Loop 主循环。
 
-        这是 stream_response 的核心实现，抽取为独立方法
-        以便在工具执行后递归调用自身发起第二轮请求。
+        循环发起请求（每轮都带工具定义），检测工具调用，
+        执行、回灌，直到模型给出纯文本答复或达到轮次上限。
+
+        与 ch03 的关键区别：
+        - ch03 硬编码两轮（第一轮带工具 → 第二轮不带工具）
+        - 现在 while 循环，每轮都带工具，模型可多次请求不同工具
+        - 达到 MAX_AGENT_ITERATIONS 后强制终止并以不带工具的请求收尾
         """
-        accumulated_text = ""
-        pending_tool_calls: list[dict] = []
+        from protocol.models import ToolCall as TCModel
 
-        async for event in protocol.chat(
-            messages=messages,
-            model=config.model,
-            thinking=config.thinking,
-            tools=tool_defs,
-        ):
-            if event.kind == StreamEvent.KIND_TEXT_DELTA:
-                accumulated_text += event.text
-                yield event
+        # 当前轮次使用的消息列表，每轮执行工具后会更新
+        current_messages = messages
+        iteration = 0
 
-            elif event.kind == StreamEvent.KIND_THINKING_DELTA:
-                pass
+        while iteration < MAX_AGENT_ITERATIONS:
+            accumulated_text = ""
+            pending_tool_calls: list[dict] = []
+            has_executed_tools = False  # 本轮是否执行了工具（决定 break 后行为）
 
-            elif event.kind == StreamEvent.KIND_TOOL_CALL_START:
-                pending_tool_calls.append({
-                    "id": event.tool_call_id,
-                    "name": event.tool_call_name,
-                    "args_str": "",
-                    "started": True,
-                    "ended": False,
-                })
-                yield event
+            # ---- 发起本轮请求（始终携带工具定义） ----
+            async for event in protocol.chat(
+                messages=current_messages,
+                model=config.model,
+                thinking=config.thinking,
+                tools=tool_defs,
+            ):
+                if event.kind == StreamEvent.KIND_TEXT_DELTA:
+                    accumulated_text += event.text
+                    yield event
 
-            elif event.kind == StreamEvent.KIND_TOOL_CALL_DELTA:
-                # 按 tool_call_id 精确匹配目标工具调用，不能简单取 [-1]
-                # 多工具并行时 delta 事件可能不按追加顺序到达
-                for tc in pending_tool_calls:
-                    if tc["id"] == event.tool_call_id and not tc["ended"]:
-                        tc["args_str"] += event.text
-                        break
-                yield event
+                elif event.kind == StreamEvent.KIND_THINKING_DELTA:
+                    pass
 
-            elif event.kind == StreamEvent.KIND_TOOL_CALL_END:
-                for tc in pending_tool_calls:
-                    if tc["id"] == event.tool_call_id and not tc["ended"]:
-                        tc["ended"] = True
-                        tc["arguments"] = event.tool_arguments or {}
-                        break
-                yield event
+                elif event.kind == StreamEvent.KIND_TOOL_CALL_START:
+                    pending_tool_calls.append({
+                        "id": event.tool_call_id,
+                        "name": event.tool_call_name,
+                        "args_str": "",
+                        "started": True,
+                        "ended": False,
+                    })
+                    yield event
 
-            elif event.kind == StreamEvent.KIND_DONE:
-                # 检查是否有已完成的工具调用
-                completed_tools = [
-                    tc for tc in pending_tool_calls
-                    if tc.get("ended") and "arguments" in tc
-                ]
+                elif event.kind == StreamEvent.KIND_TOOL_CALL_DELTA:
+                    # 按 tool_call_id 精确匹配目标工具调用，不能简单取 [-1]
+                    # 多工具并行时 delta 事件可能不按追加顺序到达
+                    for tc in pending_tool_calls:
+                        if tc["id"] == event.tool_call_id and not tc["ended"]:
+                            tc["args_str"] += event.text
+                            break
+                    yield event
 
-                if completed_tools and tool_registry:
-                    # ---- 有工具调用：构建 assistant 消息 ----
-                    from protocol.models import ToolCall as TCModel
+                elif event.kind == StreamEvent.KIND_TOOL_CALL_END:
+                    for tc in pending_tool_calls:
+                        if tc["id"] == event.tool_call_id and not tc["ended"]:
+                            tc["ended"] = True
+                            tc["arguments"] = event.tool_arguments or {}
+                            break
+                    yield event
 
-                    tool_calls_list = [
-                        TCModel(
-                            id=tc["id"],
-                            name=tc["name"],
-                            arguments=tc["arguments"],
-                        )
-                        for tc in completed_tools
+                elif event.kind == StreamEvent.KIND_DONE:
+                    # 检查是否有已完成的工具调用
+                    completed_tools = [
+                        tc for tc in pending_tool_calls
+                        if tc.get("ended") and "arguments" in tc
                     ]
 
-                    self._history.append(
-                        ChatMessage(
-                            role="assistant",
-                            content=accumulated_text.strip(),
-                            tool_calls=tool_calls_list if tool_calls_list else None,
-                        )
-                    )
-
-                    # ---- 执行工具 ----
-                    for tc in completed_tools:
-                        tool_name = tc["name"]
-                        call_id = tc["id"]
-                        args = tc["arguments"]
-
-                        tool = tool_registry.get(tool_name)
-                        if tool is None:
-                            result = ToolResult.fail(
-                                call_id, tool_name,
-                                f"未知工具：{tool_name}，可用工具有："
-                                + ", ".join(
-                                    t.name for t in tool_registry.list_tools()
-                                ),
+                    if completed_tools and tool_registry:
+                        # ---- 有工具调用：构建 assistant 消息 ----
+                        tool_calls_list = [
+                            TCModel(
+                                id=tc["id"],
+                                name=tc["name"],
+                                arguments=tc["arguments"],
                             )
-                        else:
-                            args["call_id"] = call_id
-                            try:
-                                result = await tool.execute(args)
-                            except Exception as e:
-                                result = ToolResult.fail(
-                                    call_id, tool_name,
-                                    f"工具执行异常：{e}",
-                                )
+                            for tc in completed_tools
+                        ]
 
-                        # 产出工具结果事件
-                        yield StreamEvent(
-                            kind=StreamEvent.KIND_TOOL_EXECUTED,
-                            tool_call_id=call_id,
-                            tool_call_name=tool_name,
-                            text=result.content,
-                            tool_arguments={"success": result.success},
-                        )
-
-                        # 回灌
-                        self._history.append(
-                            ChatMessage(
-                                role="tool",
-                                content=result.content,
-                                tool_call_id=call_id,
-                                name=tool_name,
-                            )
-                        )
-
-                    # ---- 第二轮请求（不带工具，纯文本） ----
-                    second_messages = [
-                        ChatMessage(role="system", content=system_content)
-                    ] + self._history
-
-                    second_text = ""
-                    async for event2 in protocol.chat(
-                        messages=second_messages,
-                        model=config.model,
-                        thinking=config.thinking,
-                        tools=None,  # 单轮约束
-                    ):
-                        if event2.kind == StreamEvent.KIND_TEXT_DELTA:
-                            second_text += event2.text
-                            yield event2
-                        elif event2.kind == StreamEvent.KIND_THINKING_DELTA:
-                            pass
-                        elif event2.kind == StreamEvent.KIND_DONE:
-                            if second_text.strip():
-                                self._history.append(
-                                    ChatMessage(
-                                        role="assistant",
-                                        content=second_text,
-                                    )
-                                )
-                            yield event2
-                            return
-                        elif event2.kind == StreamEvent.KIND_ERROR:
-                            yield event2
-                            return
-
-                    # 第二轮边界情况
-                    if second_text.strip():
                         self._history.append(
                             ChatMessage(
                                 role="assistant",
-                                content=second_text,
+                                content=accumulated_text.strip(),
+                                tool_calls=tool_calls_list if tool_calls_list else None,
                             )
                         )
-                    yield StreamEvent(kind=StreamEvent.KIND_DONE)
+
+                        # ---- 执行工具 ----
+                        for tc in completed_tools:
+                            tool_name = tc["name"]
+                            call_id = tc["id"]
+                            args = tc["arguments"]
+
+                            tool = tool_registry.get(tool_name)
+                            if tool is None:
+                                result = ToolResult.fail(
+                                    call_id, tool_name,
+                                    f"未知工具：{tool_name}，可用工具有："
+                                    + ", ".join(
+                                        t.name for t in tool_registry.list_tools()
+                                    ),
+                                )
+                            else:
+                                args["call_id"] = call_id
+                                try:
+                                    result = await tool.execute(args)
+                                except Exception as e:
+                                    result = ToolResult.fail(
+                                        call_id, tool_name,
+                                        f"工具执行异常：{e}",
+                                    )
+
+                            # 产出工具结果事件
+                            yield StreamEvent(
+                                kind=StreamEvent.KIND_TOOL_EXECUTED,
+                                tool_call_id=call_id,
+                                tool_call_name=tool_name,
+                                text=result.content,
+                                tool_arguments={"success": result.success},
+                            )
+
+                            # 回灌工具结果到历史
+                            self._history.append(
+                                ChatMessage(
+                                    role="tool",
+                                    content=result.content,
+                                    tool_call_id=call_id,
+                                    name=tool_name,
+                                )
+                            )
+
+                        # ---- 准备下一轮消息 ----
+                        # 将 system prompt + 更新后的 history 作为下一轮的消息
+                        current_messages = [
+                            ChatMessage(role="system", content=system_content)
+                        ] + self._history
+                        # 退出内层 async for，外层 while 继续下一轮
+                        has_executed_tools = True
+                        break
+
+                    # ---- 无工具调用：模型给出纯文本答复，正常结束 ----
+                    if accumulated_text.strip():
+                        self._history.append(
+                            ChatMessage(role="assistant", content=accumulated_text)
+                        )
+                    yield event
                     return
 
-                # ---- 无工具调用：和 ch02 一样 ----
-                if accumulated_text.strip():
+                elif event.kind == StreamEvent.KIND_ERROR:
+                    yield event
+                    return
+
+            # ---- 内层 async for 之后 ----
+            # break（有工具已执行）→ iteration += 1，进入下一轮
+            # 流异常结束（无 break/return 到达此处）→ 收尾退出
+            if has_executed_tools:
+                # 本轮有工具已执行，准备下一轮循环
+                iteration += 1
+                continue
+
+            # 边界情况：流正常结束但未收到 done/error
+            if accumulated_text.strip():
+                self._history.append(
+                    ChatMessage(role="assistant", content=accumulated_text)
+                )
+            yield StreamEvent(kind=StreamEvent.KIND_DONE)
+            return
+
+        # ---- 达到最大轮次上限 ----
+        limit_msg = (
+            f"已达到最大工具调用轮次（{MAX_AGENT_ITERATIONS} 轮），"
+            "请基于已有的工具调用结果给出当前最佳答复。"
+        )
+        self._history.append(ChatMessage(role="user", content=limit_msg))
+
+        # 以不带工具的最后一次请求收尾，产出纯文本答复
+        final_messages = [
+            ChatMessage(role="system", content=system_content)
+        ] + self._history
+
+        final_text = ""
+        async for event in protocol.chat(
+            messages=final_messages,
+            model=config.model,
+            thinking=config.thinking,
+            tools=None,
+        ):
+            if event.kind == StreamEvent.KIND_TEXT_DELTA:
+                final_text += event.text
+                yield event
+            elif event.kind == StreamEvent.KIND_THINKING_DELTA:
+                pass
+            elif event.kind == StreamEvent.KIND_DONE:
+                if final_text.strip():
                     self._history.append(
-                        ChatMessage(role="assistant", content=accumulated_text)
+                        ChatMessage(role="assistant", content=final_text)
                     )
                 yield event
                 return
-
             elif event.kind == StreamEvent.KIND_ERROR:
                 yield event
                 return
 
-        # 边界情况：循环正常结束但没收到 done/error
-        if accumulated_text.strip():
+        # 上限最终请求边界情况
+        if final_text.strip():
             self._history.append(
-                ChatMessage(role="assistant", content=accumulated_text)
+                ChatMessage(role="assistant", content=final_text)
             )
         yield StreamEvent(kind=StreamEvent.KIND_DONE)
