@@ -27,6 +27,11 @@ class GlobSearch(BaseTool):
     """
 
     @property
+    def is_read_only(self) -> bool:
+        """仅按模式查找文件路径，不修改文件系统。"""
+        return True
+
+    @property
     def name(self) -> str:
         return "glob_search"
 

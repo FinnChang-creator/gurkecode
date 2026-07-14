@@ -55,6 +55,33 @@ without requesting additional tools.\
 # 防止模型陷入无限工具调用循环，达到上限后强制终止并以不带工具的请求收尾
 MAX_AGENT_ITERATIONS = 50
 
+# 计划模式（/plan）系统提示词
+# 告诉模型它处于计划模式，只能使用只读工具探索代码库并制定计划
+PLAN_MODE_SYSTEM_PROMPT = """\
+You are gurkecode, an AI assistant running in the terminal.
+
+You are in **PLAN MODE**. In this mode:
+- You have access to **read-only tools** (read_file, glob_search, grep_search) to explore \
+the codebase and understand the current implementation.
+- You CANNOT make any changes — no writing files, editing files, or executing commands.
+- Your goal is to understand the user's request, explore relevant code, and produce a \
+**detailed implementation plan**.
+- Your plan should include: files to create/modify, specific changes needed, \
+the order of operations, and any architectural decisions or trade-offs.
+- Be thorough and concrete — reference actual file paths and line numbers from your exploration.
+- Once your plan is complete, tell the user they can switch to execution mode with `/do`.
+
+The user is a developer working at the command line. Adapt your responses accordingly.\
+"""
+
+# /do 触发消息
+# 当用户输入 /do 时，将此消息注入对话历史，触发模型按前面制定的计划执行
+DO_TRIGGER_MESSAGE = (
+    "请按照上面制定的计划，现在开始执行。"
+    "你可以使用所有工具（包括写入文件、编辑文件和执行命令）。"
+    "按照计划中的步骤和顺序逐一实施，每完成一个步骤后评估结果再继续下一步。"
+)
+
 
 class ChatEngine:
     """对话引擎。
@@ -67,15 +94,22 @@ class ChatEngine:
       发起请求（带工具）→ 检测工具调用 → 执行 → 回灌历史 → 继续下一轮
       模型返回纯文本（无工具调用）时自然终止
     达到上限时强制终止并以不带工具的请求收尾
+
+    计划模式（Plan Mode）：
+    - /plan 进入：仅注入只读工具，使用计划态系统提示，
+      模型只能探索和制定计划，不能动手改动。
+    - /do 退出：恢复全工具，注入触发消息让模型按计划执行。
+    - 模式跨轮保持，直到再次切换。
     """
 
     def __init__(self):
         """初始化对话引擎。
 
-        创建空的对话历史列表。
+        创建空的对话历史列表，初始为非计划模式。
         系统提示词在每次请求时作为消息列表的第一条加入，不持久化在历史中。
         """
         self._history: list[ChatMessage] = []
+        self._plan_mode: bool = False
 
     @property
     def history(self) -> list[ChatMessage]:
@@ -86,6 +120,36 @@ class ChatEngine:
         在工具模式下，历史中还可能包含 tool 角色消息。
         """
         return self._history
+
+    @property
+    def plan_mode(self) -> bool:
+        """当前是否处于计划模式。
+
+        计划模式下仅注入只读工具定义 + 计划态系统提示，
+        模型只能探索和分析，不能修改文件或执行命令。
+
+        Returns:
+            True 表示当前处于计划模式
+        """
+        return self._plan_mode
+
+    def enter_plan_mode(self) -> None:
+        """进入计划模式。
+
+        此后所有请求将：
+        - 仅注入只读工具定义（read_file / glob_search / grep_search）
+        - 使用计划态系统提示（告知模型先出计划、不动手改动）
+        模式跨轮保持，直到调用 exit_plan_mode()。
+        """
+        self._plan_mode = True
+
+    def exit_plan_mode(self) -> None:
+        """退出计划模式。
+
+        恢复为全工具定义和标准系统提示。
+        通常配合 /do 使用：退出后立即注入触发消息让模型按计划执行。
+        """
+        self._plan_mode = False
 
     def add_user_message(self, text: str) -> None:
         """将用户消息追加到对话历史。
@@ -121,18 +185,31 @@ class ChatEngine:
             StreamEvent 序列：text_delta / tool_call_* / tool_executed / done / error
         """
         # ---- 1. 组装上下文 ----
-        system_content = SYSTEM_PROMPT
-        if tool_registry is not None and len(tool_registry.list_tools()) > 0:
-            system_content += TOOLS_APPEND_PROMPT
+        # 根据是否处于计划模式选择不同的系统提示词和工具定义
+        if self._plan_mode:
+            # 计划模式：使用计划态系统提示，仅注入只读工具
+            system_content = PLAN_MODE_SYSTEM_PROMPT
+        else:
+            # 正常模式：标准系统提示 + 工具使用约定
+            system_content = SYSTEM_PROMPT
+            if tool_registry is not None and len(tool_registry.list_tools()) > 0:
+                system_content += TOOLS_APPEND_PROMPT
 
         full_messages = [
             ChatMessage(role="system", content=system_content)
         ] + self._history
 
         # ---- 导出工具定义 ----
+        # 计划模式下仅注入只读工具，正常模式下注入全部工具
         tool_defs: list[dict] | None = None
         if tool_registry is not None:
-            tool_defs = tool_registry.export_definitions()
+            if self._plan_mode:
+                tool_defs = tool_registry.export_read_only_definitions()
+                # 如果没有注册任何只读工具，tool_defs 保持为 None
+                if not tool_defs:
+                    tool_defs = None
+            else:
+                tool_defs = tool_registry.export_definitions()
 
         # ---- 2. 发起流式请求 ----
         async for event in self._do_agent_loop(

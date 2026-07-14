@@ -28,6 +28,11 @@ class GrepSearch(BaseTool):
     """
 
     @property
+    def is_read_only(self) -> bool:
+        """仅搜索文件内容，不修改文件系统。"""
+        return True
+
+    @property
     def name(self) -> str:
         return "grep_search"
 

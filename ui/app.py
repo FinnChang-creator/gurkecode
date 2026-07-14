@@ -14,7 +14,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 
 from config.models import ProviderConfig
-from engine import ChatEngine
+from engine import ChatEngine, DO_TRIGGER_MESSAGE
 from protocol.adapter import create_protocol
 from protocol.models import ChatProtocol, StreamEvent
 from tools import registry as tool_registry
@@ -154,10 +154,12 @@ class GurkeApp(App):
 
         完整的对话流程：
         1. 检查 /exit 命令 → 退出
-        2. 追加用户消息 → 禁止提交（但保持可键入）→ 启动计时
-        3. 遍历流式事件 → 更新 ChatView
-        4. 用户可按 Escape 取消流式（触发 asyncio.CancelledError）
-        5. 收尾：markdown 渲染 / 错误展示 → 停止计时 → 恢复提交
+        2. 检查 /plan 命令 → 进入计划模式
+        3. 检查 /do 命令 → 退出计划模式 + 注入触发消息执行
+        4. 追加用户消息 → 禁止提交（但保持可键入）→ 启动计时
+        5. 遍历流式事件 → 更新 ChatView
+        6. 用户可按 Escape 取消流式（触发 asyncio.CancelledError）
+        7. 收尾：markdown 渲染 / 错误展示 → 停止计时 → 恢复提交
 
         Args:
             text: 用户输入的文本
@@ -167,14 +169,36 @@ class GurkeApp(App):
             self.exit()
             return
 
-        # ---- 2. 准备工作 ----
         chat_view = self.query_one(ChatView)
+
+        # ---- 2. /plan 命令：进入计划模式 ----
+        if text.strip() == "/plan":
+            self._engine.enter_plan_mode()
+            chat_view.append_system(
+                "▸ 已进入计划模式 — 仅只读工具可用（读取文件 / 查找文件 / 搜索内容），"
+                "模型将先探索代码并制定计划。"
+                "输入你的需求后，模型会给出详细实施方案。"
+                "确认计划后输入 /do 切换回全工具模式并执行。"
+            )
+            return
+
+        # ---- 3. /do 命令：退出计划模式并触发执行 ----
+        if text.strip() == "/do":
+            self._engine.exit_plan_mode()
+            chat_view.append_system(
+                "▸ 已退出计划模式 — 全工具恢复，开始按计划执行..."
+            )
+            # 在对话区显示 "/do"，向引擎注入触发消息
+            chat_view.append_user("/do")
+            self._engine.add_user_message(DO_TRIGGER_MESSAGE)
+        else:
+            # ---- 普通消息：追加用户消息到对话区和引擎历史 ----
+            chat_view.append_user(text)
+            self._engine.add_user_message(text)
+
+        # ---- 4. 准备工作 ----
         status_bar = self.query_one(StatusBar)
         input_box = self.query_one(InputBox)
-
-        # 追加用户消息到对话区和引擎历史
-        chat_view.append_user(text)
-        self._engine.add_user_message(text)
 
         # 禁止提交（但保持输入框可编辑，用户可提前键入下一条消息）
         input_box.disabled = True
