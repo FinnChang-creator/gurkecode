@@ -92,6 +92,22 @@ class BaseTool(ABC):
         """
         ...
 
+    @property
+    def is_read_only(self) -> bool:
+        """是否为只读工具。
+
+        只读工具不会修改文件系统、不会执行命令、不会产生副作用。
+        在计划模式（/plan）下，只有只读工具对模型可见，
+        确保模型只能探索和分析，不能动手改动。
+
+        子类应覆盖此属性：read_file / glob_search / grep_search 返回 True，
+        write_file / edit_file / bash 保持默认 False。
+
+        Returns:
+            True 表示该工具为只读工具，False 表示有副作用
+        """
+        return False
+
     @abstractmethod
     async def execute(self, arguments: dict) -> ToolResult:
         """执行工具，返回结构化结果。

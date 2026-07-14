@@ -88,3 +88,39 @@ class ToolRegistry:
             }
             for tool in self._tools.values()
         ]
+
+    def list_read_only_tools(self) -> list[BaseTool]:
+        """列出所有只读工具。
+
+        只读工具不会修改文件系统或执行命令，
+        用于计划模式（/plan）下限制模型只能探索和分析。
+
+        Returns:
+            只读工具实例列表
+        """
+        return [t for t in self._tools.values() if t.is_read_only]
+
+    def export_read_only_definitions(self) -> list[dict]:
+        """只导出只读工具定义为通用 API 格式。
+
+        在计划模式（/plan）下使用，让模型只能看到和使用
+        read_file / glob_search / grep_search 等只读工具，
+        无法调用 write_file / edit_file / bash 等有副作用的工具。
+
+        格式与 export_definitions() 相同。
+
+        Returns:
+            只读工具定义列表
+        """
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                },
+            }
+            for tool in self._tools.values()
+            if tool.is_read_only
+        ]
