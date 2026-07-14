@@ -50,7 +50,10 @@ class ReadFile(BaseTool):
             "Use this tool when you need to look at the contents of a file "
             "to understand code, configuration, or any text-based file. "
             "The file path can be absolute or relative to the current working directory. "
-            "If the file does not exist or cannot be read, an error message is returned."
+            "If the file does not exist or cannot be read, an error message is returned. "
+            "IMPORTANT: You MUST read a file before editing it — "
+            "never edit or write to a file you haven't read first. "
+            "The file may have changed since you last saw it."
         )
 
     @property

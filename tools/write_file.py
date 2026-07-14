@@ -37,7 +37,10 @@ class WriteFile(BaseTool):
             "If the parent directory does not exist, it will be created automatically. "
             "Use this tool when you need to create or overwrite a file "
             "with specific content, such as writing code, configuration, or documentation. "
-            "The path can be absolute or relative to the current working directory."
+            "The path can be absolute or relative to the current working directory. "
+            "NOTE: This tool overwrites the entire file. "
+            "For partial edits to an existing file, use the edit_file tool instead. "
+            "For creating new files, this is the correct tool."
         )
 
     @property

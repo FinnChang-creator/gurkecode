@@ -15,67 +15,20 @@ from collections.abc import AsyncIterator
 
 from config.models import ProviderConfig
 from protocol.models import ChatMessage, ChatProtocol, StreamEvent
+from prompt.builder import PromptBuilder, create_default_sections
+from prompt.environment import collect_environment, format_environment
+from prompt.reminder import ReminderBuilder, ReminderState
 from tools.base import ToolResult
 from tools.registry import ToolRegistry
 
-
-# 内置系统提示词
-# 告诉模型它在终端环境中运行，作为 AI 编程助手
-# 当有工具可用时，追加工具使用约定说明
-SYSTEM_PROMPT = """\
-You are gurkecode, an AI assistant running in the terminal.
-
-You are designed to help users with software engineering tasks — reading, writing, \
-and reasoning about code. You have access to the current working directory and can \
-discuss files, architecture, and implementation details.
-
-Be concise and direct. When discussing code, reference file paths and line numbers. \
-Use markdown for code blocks, lists, and structured responses.
-
-The user is a developer working at the command line. Adapt your responses accordingly.\
-"""
-
-# 工具系统追加提示：当有工具可用时追加到 system prompt
-TOOLS_APPEND_PROMPT = """
-
-You have access to tools that let you read files, write files, edit files, \
-execute shell commands, search for files by pattern, and search file contents. \
-When you need information that a tool can provide, use it — don't guess. \
-When the user asks you to perform an action (read a file, run a command, etc.), \
-use the appropriate tool immediately.
-
-After receiving tool results, use them to give a complete, accurate answer. \
-You may call tools across multiple rounds until the task is complete — \
-each round you can request new tools based on previous results. \
-When you have enough information, provide your final text answer \
-without requesting additional tools.\
-"""
 
 # Agent Loop 最大循环轮次上限
 # 防止模型陷入无限工具调用循环，达到上限后强制终止并以不带工具的请求收尾
 MAX_AGENT_ITERATIONS = 50
 
-# 计划模式（/plan）系统提示词
-# 告诉模型它处于计划模式，只能使用只读工具探索代码库并制定计划
-PLAN_MODE_SYSTEM_PROMPT = """\
-You are gurkecode, an AI assistant running in the terminal.
-
-You are in **PLAN MODE**. In this mode:
-- You have access to **read-only tools** (read_file, glob_search, grep_search) to explore \
-the codebase and understand the current implementation.
-- You CANNOT make any changes — no writing files, editing files, or executing commands.
-- Your goal is to understand the user's request, explore relevant code, and produce a \
-**detailed implementation plan**.
-- Your plan should include: files to create/modify, specific changes needed, \
-the order of operations, and any architectural decisions or trade-offs.
-- Be thorough and concrete — reference actual file paths and line numbers from your exploration.
-- Once your plan is complete, tell the user they can switch to execution mode with `/do`.
-
-The user is a developer working at the command line. Adapt your responses accordingly.\
-"""
-
 # /do 触发消息
-# 当用户输入 /do 时，将此消息注入对话历史，触发模型按前面制定的计划执行
+# 当用户输入 /do 时，通过 reminder 机制注入此消息，
+# 触发模型按前面制定的计划执行
 DO_TRIGGER_MESSAGE = (
     "请按照上面制定的计划，现在开始执行。"
     "你可以使用所有工具（包括写入文件、编辑文件和执行命令）。"
@@ -105,11 +58,19 @@ class ChatEngine:
     def __init__(self):
         """初始化对话引擎。
 
-        创建空的对话历史列表，初始为非计划模式。
-        系统提示词在每次请求时作为消息列表的第一条加入，不持久化在历史中。
+        创建空的对话历史列表，初始为非计划模式，
+        初始化模块化系统提示拼装器和提醒状态。
+        系统提示词在每次请求时动态拼装，不持久化在历史中。
         """
         self._history: list[ChatMessage] = []
         self._plan_mode: bool = False
+
+        # 模块化系统提示拼装器（跨轮复用，内容稳定）
+        self._prompt_builder: PromptBuilder = create_default_sections()
+
+        # 补充消息注入状态（追踪计划模式提醒轮次）
+        self._reminder_state = ReminderState()
+        self._reminder_builder = ReminderBuilder(self._reminder_state)
 
     @property
     def history(self) -> list[ChatMessage]:
@@ -138,10 +99,12 @@ class ChatEngine:
 
         此后所有请求将：
         - 仅注入只读工具定义（read_file / glob_search / grep_search）
-        - 使用计划态系统提示（告知模型先出计划、不动手改动）
+        - 通过 reminder 机制注入计划态约束（不替换系统提示，保持缓存命中）
         模式跨轮保持，直到调用 exit_plan_mode()。
         """
         self._plan_mode = True
+        # 重置提醒轮次：新计划模式从第 0 轮开始
+        self._reminder_state.iteration = 0
 
     def exit_plan_mode(self) -> None:
         """退出计划模式。
@@ -184,23 +147,27 @@ class ChatEngine:
         Yields:
             StreamEvent 序列：text_delta / tool_call_* / tool_executed / done / error
         """
-        # ---- 1. 组装上下文 ----
-        # 根据是否处于计划模式选择不同的系统提示词和工具定义
-        if self._plan_mode:
-            # 计划模式：使用计划态系统提示，仅注入只读工具
-            system_content = PLAN_MODE_SYSTEM_PROMPT
-        else:
-            # 正常模式：标准系统提示 + 工具使用约定
-            system_content = SYSTEM_PROMPT
-            if tool_registry is not None and len(tool_registry.list_tools()) > 0:
-                system_content += TOOLS_APPEND_PROMPT
+        # ---- 1. 组装系统提示 ----
+        # F1/F3: 模块化拼装稳定系统提示（跨轮不变，可缓存）
+        stable_system = self._prompt_builder.build()
 
-        full_messages = [
-            ChatMessage(role="system", content=system_content)
-        ] + self._history
+        # F2: 采集环境信息（每轮可能变化，不走缓存）
+        env_info = await collect_environment(config.model)
+        env_text = format_environment(env_info)
+
+        # 两条独立的 system 消息：
+        # 第一条：稳定模块 → Anthropic 打 cache_control，OpenAI 放最前前缀缓存
+        # 第二条：环境信息 → 每次都变化，不缓存
+        system_msgs = [
+            ChatMessage(role="system", content=stable_system),
+            ChatMessage(role="system", content=env_text),
+        ]
+
+        full_messages = system_msgs + self._history
 
         # ---- 导出工具定义 ----
         # 计划模式下仅注入只读工具，正常模式下注入全部工具
+        # 系统提示保持不变（不替换文本），计划态约束由 reminder 注入
         tool_defs: list[dict] | None = None
         if tool_registry is not None:
             if self._plan_mode:
@@ -214,7 +181,7 @@ class ChatEngine:
         # ---- 2. 发起流式请求 ----
         async for event in self._do_agent_loop(
             protocol, config, tool_registry, full_messages,
-            tool_defs, system_content,
+            tool_defs, system_msgs,
         ):
             yield event
 
@@ -225,17 +192,18 @@ class ChatEngine:
         tool_registry: ToolRegistry | None,
         messages: list[ChatMessage],
         tool_defs: list[dict] | None,
-        system_content: str,
+        system_msgs: list[ChatMessage],
     ) -> AsyncIterator[StreamEvent]:
         """Agent Loop 主循环。
 
         循环发起请求（每轮都带工具定义），检测工具调用，
         执行、回灌，直到模型给出纯文本答复或达到轮次上限。
 
-        与 ch03 的关键区别：
-        - ch03 硬编码两轮（第一轮带工具 → 第二轮不带工具）
+        与 ch04 的关键区别：
+        - ch04 硬编码两轮（第一轮带工具 → 第二轮不带工具）
         - 现在 while 循环，每轮都带工具，模型可多次请求不同工具
         - 达到 MAX_AGENT_ITERATIONS 后强制终止并以不带工具的请求收尾
+        - 计划模式下每轮注入 system-reminder（频率可控）
         """
         from protocol.models import ToolCall as TCModel
 
@@ -244,13 +212,25 @@ class ChatEngine:
         iteration = 0
 
         while iteration < MAX_AGENT_ITERATIONS:
+            # ---- 补充消息注入（F6/F7） ----
+            # 计划模式下每轮注入 system-reminder，不写入持久历史
+            reminder_msg = None
+            if self._plan_mode:
+                reminder_msg = self._reminder_builder.build_plan_reminder()
+                self._reminder_state.iteration += 1
+
+            # 本轮消息 = system 消息 + 可选 reminder + 历史
+            round_messages = list(current_messages)
+            if reminder_msg:
+                round_messages.append(reminder_msg)
+
             accumulated_text = ""
             pending_tool_calls: list[dict] = []
             has_executed_tools = False  # 本轮是否执行了工具（决定 break 后行为）
 
             # ---- 发起本轮请求（始终携带工具定义） ----
             async for event in protocol.chat(
-                messages=current_messages,
+                messages=round_messages,
                 model=config.model,
                 thinking=config.thinking,
                 tools=tool_defs,
@@ -360,10 +340,8 @@ class ChatEngine:
                             )
 
                         # ---- 准备下一轮消息 ----
-                        # 将 system prompt + 更新后的 history 作为下一轮的消息
-                        current_messages = [
-                            ChatMessage(role="system", content=system_content)
-                        ] + self._history
+                        # 将 system 消息 + 更新后的 history 作为下一轮的消息
+                        current_messages = system_msgs + self._history
                         # 退出内层 async for，外层 while 继续下一轮
                         has_executed_tools = True
                         break
@@ -404,9 +382,7 @@ class ChatEngine:
         self._history.append(ChatMessage(role="user", content=limit_msg))
 
         # 以不带工具的最后一次请求收尾，产出纯文本答复
-        final_messages = [
-            ChatMessage(role="system", content=system_content)
-        ] + self._history
+        final_messages = system_msgs + self._history
 
         final_text = ""
         async for event in protocol.chat(

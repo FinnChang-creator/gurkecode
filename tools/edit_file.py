@@ -32,6 +32,8 @@ class EditFile(BaseTool):
     @property
     def description(self) -> str:
         return (
+            "IMPORTANT: You MUST call read_file first to read the file's current content "
+            "before editing. Never edit a file you haven't read. "
             "Replace a specific string in a file with a new string. "
             "The old_string must match exactly once in the file — "
             "if it matches zero times or more than once, the edit is rejected "
