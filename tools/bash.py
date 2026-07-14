@@ -47,7 +47,11 @@ class Bash(BaseTool):
             "if it runs longer, it will be terminated and a timeout error returned. "
             "Use this tool for running development commands (build, test, lint), "
             "inspecting the environment, or any other shell operation. "
-            "Long-running servers and interactive programs are not suitable."
+            "Long-running servers and interactive programs are not suitable. "
+            "IMPORTANT: Prefer dedicated tools (read_file, write_file, edit_file, "
+            "glob_search, grep_search) over shell commands when they can achieve "
+            "the same result. Use bash only when dedicated tools cannot accomplish "
+            "the task."
         ).format(BASH_TIMEOUT)
 
     @property

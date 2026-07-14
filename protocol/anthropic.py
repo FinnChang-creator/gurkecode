@@ -17,7 +17,7 @@ from typing import AsyncIterator
 
 import httpx
 
-from protocol.models import ChatMessage, ChatProtocol, StreamEvent
+from protocol.models import ChatMessage, ChatProtocol, StreamEvent, Usage
 
 
 # Anthropic Messages API 默认端点
@@ -51,6 +51,9 @@ class AnthropicProtocol(ChatProtocol):
         # 跟踪正在构建的 tool_use 块（每次请求独立）
         # 键为 content_block index → {id, name, args_str}
         self._pending_tool_uses: dict[int, dict] = {}
+        # 最近一次请求的用量信息（从 message_start 事件中解析）
+        # 在流结束时作为 KIND_USAGE 事件产出
+        self._last_usage: Usage | None = None
 
     @property
     def protocol_name(self) -> str:
@@ -73,8 +76,9 @@ class AnthropicProtocol(ChatProtocol):
         Yields:
             StreamEvent 序列
         """
-        # 清除上一次请求可能残留的工具状态
+        # 清除上一次请求可能残留的工具状态和用量
         self._pending_tool_uses.clear()
+        self._last_usage = None
 
         # 构建请求体：Anthropic 需要分离 system 和 messages
         body = self._build_request_body(messages, model, thinking, tools)
@@ -111,10 +115,17 @@ class AnthropicProtocol(ChatProtocol):
                                 if event:
                                     yield event
                                     # done 或 error 事件后停止遍历
-                                    if event.kind in (
-                                        StreamEvent.KIND_DONE,
-                                        StreamEvent.KIND_ERROR,
-                                    ):
+                                    if event.kind == StreamEvent.KIND_DONE:
+                                        # 在 done 之前产出用量事件（如有缓存信息）
+                                        if self._last_usage:
+                                            yield StreamEvent(
+                                                kind=StreamEvent.KIND_USAGE,
+                                                usage=self._last_usage,
+                                            )
+                                        yield event
+                                        return
+                                    elif event.kind == StreamEvent.KIND_ERROR:
+                                        yield event
                                         return
                                 current_event = None
                             continue
@@ -160,14 +171,20 @@ class AnthropicProtocol(ChatProtocol):
             Anthropic API 请求体字典
         """
         # 从 messages 中提取 system 消息（Anthropic 要求 system 作为顶层参数，不放在 messages 里）
-        system_content = ""
+        # F3 缓存策略：多条 system 消息分别作为独立 content block，
+        # 第一个（稳定模块）打 cache_control 标记让 Anthropic 缓存复用
+        system_blocks: list[dict] = []
         chat_messages = []
 
         i = 0
         while i < len(messages):
             msg = messages[i]
             if msg.role == "system":
-                system_content = msg.content
+                block: dict = {"type": "text", "text": msg.content}
+                # 仅在第一个 system block（稳定模块）上打缓存断点
+                if not system_blocks:
+                    block["cache_control"] = {"type": "ephemeral"}
+                system_blocks.append(block)
                 i += 1
             elif msg.role == "user":
                 chat_messages.append({"role": "user", "content": msg.content})
@@ -227,9 +244,9 @@ class AnthropicProtocol(ChatProtocol):
             "max_tokens": 8192,
         }
 
-        # 如果有 system prompt，作为顶层参数
-        if system_content:
-            body["system"] = system_content
+        # 如果有 system prompt blocks，作为顶层参数（list 格式）
+        if system_blocks:
+            body["system"] = system_blocks
 
         # thinking 参数：设置 thinking budget（至少 1024 tokens）并告知需要思考内容
         if thinking:
@@ -277,8 +294,25 @@ class AnthropicProtocol(ChatProtocol):
         except json.JSONDecodeError:
             return None
 
+        # ---- message_start：解析用量信息（含缓存字段） ----
+        if event_type == "message_start":
+            message = data.get("message", {})
+            usage_data = message.get("usage", {})
+            if usage_data:
+                self._last_usage = Usage(
+                    input_tokens=usage_data.get("input_tokens", 0),
+                    output_tokens=usage_data.get("output_tokens", 0),
+                    cache_read_tokens=usage_data.get(
+                        "cache_read_input_tokens", 0
+                    ),
+                    cache_write_tokens=usage_data.get(
+                        "cache_creation_input_tokens", 0
+                    ),
+                )
+            return None  # message_start 不产出 StreamEvent，仅记录用量
+
         # ---- content_block_start：检测 tool_use 块的开始 ----
-        if event_type == "content_block_start":
+        elif event_type == "content_block_start":
             content_block = data.get("content_block", {})
             if content_block.get("type") == "tool_use":
                 index = data.get("index", 0)

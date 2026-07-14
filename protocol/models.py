@@ -54,6 +54,26 @@ class ChatMessage:
 
 
 @dataclass
+class Usage:
+    """一次 LLM 请求的 token 用量，含缓存命中信息。
+
+    从 provider 响应中的 usage 字段提取。
+    缓存字段为 0 时表示未命中或该 provider 不支持缓存。
+
+    Attributes:
+        input_tokens: 本次请求的输入 token 数
+        output_tokens: 本次请求的输出 token 数
+        cache_read_tokens: 从缓存中读取（命中）的 token 数，0 表示未命中
+        cache_write_tokens: 新写入缓存的 token 数，0 表示未创建或已存在
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+
+
+@dataclass
 class StreamEvent:
     """流式响应中的一个事件。
 
@@ -82,6 +102,7 @@ class StreamEvent:
     tool_call_id: str = ""
     tool_call_name: str = ""
     tool_arguments: dict | None = None
+    usage: "Usage | None" = None
 
     # 事件类型常量，避免调用方硬编码字符串
     KIND_TEXT_DELTA = "text_delta"
@@ -91,6 +112,7 @@ class StreamEvent:
     KIND_TOOL_CALL_END = "tool_call_end"
     KIND_TOOL_EXECUTED = "tool_executed"
     KIND_DONE = "done"
+    KIND_USAGE = "usage"
     KIND_ERROR = "error"
 
 

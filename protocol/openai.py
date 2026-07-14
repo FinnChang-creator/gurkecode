@@ -16,7 +16,7 @@ from typing import AsyncIterator
 
 import httpx
 
-from protocol.models import ChatMessage, ChatProtocol, StreamEvent
+from protocol.models import ChatMessage, ChatProtocol, StreamEvent, Usage
 
 
 # OpenAI Chat Completions API 默认端点
@@ -44,6 +44,8 @@ class OpenAIProtocol(ChatProtocol):
         """
         self._api_key = api_key
         self._base_url = (base_url or OPENAI_DEFAULT_BASE_URL).rstrip("/")
+        # 最近一次请求的用量信息（从最后一个含 usage 的 chunk 中解析）
+        self._last_usage: Usage | None = None
 
     @property
     def protocol_name(self) -> str:
@@ -66,6 +68,9 @@ class OpenAIProtocol(ChatProtocol):
         Yields:
             StreamEvent 序列
         """
+        # 重置上一次请求的用量
+        self._last_usage = None
+
         # 构建 OpenAI Chat Completions 请求体（含工具定义）
         body = self._build_request_body(messages, model, tools)
         url = f"{self._base_url}/v1/chat/completions"
@@ -103,6 +108,12 @@ class OpenAIProtocol(ChatProtocol):
 
                         # [DONE] 标记：流正常结束
                         if data_str.strip() == "[DONE]":
+                            # 在 done 之前产出用量事件（如有）
+                            if self._last_usage:
+                                yield StreamEvent(
+                                    kind=StreamEvent.KIND_USAGE,
+                                    usage=self._last_usage,
+                                )
                             # 产出所有已完成 tool_call 的 end 事件
                             for idx in sorted(_tool_states.keys()):
                                 state = _tool_states[idx]
@@ -125,6 +136,23 @@ class OpenAIProtocol(ChatProtocol):
                             data = json.loads(data_str)
                         except json.JSONDecodeError:
                             continue
+
+                        # ---- 提取 usage（含缓存字段） ----
+                        # OpenAI 在最后一个非流式 chunk 或含 usage 的 chunk 中返回用量
+                        usage_data = data.get("usage")
+                        if usage_data:
+                            prompt_details = usage_data.get(
+                                "prompt_tokens_details", {}
+                            )
+                            self._last_usage = Usage(
+                                input_tokens=usage_data.get("prompt_tokens", 0),
+                                output_tokens=usage_data.get("completion_tokens", 0),
+                                cache_read_tokens=prompt_details.get(
+                                    "cached_tokens", 0
+                                ),
+                                # OpenAI 不单独报告 cache_write
+                                cache_write_tokens=0,
+                            )
 
                         choices = data.get("choices", [])
                         if not choices:
@@ -249,8 +277,18 @@ class OpenAIProtocol(ChatProtocol):
         Returns:
             OpenAI API 请求体字典
         """
-        openai_messages = []
+        # F3 缓存策略：system 消息放最前面，让 OpenAI 前缀缓存匹配
+        # 第一条 system（稳定模块）被缓存，第二条 system（环境信息）变化导致前缀断开
+        system_msgs = []
+        other_msgs = []
         for msg in messages:
+            if msg.role == "system":
+                system_msgs.append(msg)
+            else:
+                other_msgs.append(msg)
+
+        openai_messages = []
+        for msg in system_msgs + other_msgs:
             entry: dict = {"role": msg.role}
 
             # assistant 消息：可能带有工具调用
